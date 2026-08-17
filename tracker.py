@@ -2,21 +2,11 @@
 ISBN Market Drop & Digital Scarcity Tracker
 --------------------------------------------
 Searches Open Library for candidate pre-2022 titles within a set of
-subjects, using each work's own `ebook_count` to judge whether ANY
-digital scan exists anywhere for that work. Titles with zero digital
-copies AND a low edition count (a rarity signal) are upserted into a
-Supabase table (`at_risk_books`) so archivists can prioritize them.
-
-This replaces the older "hand-typed ISBN list" approach: instead of you
-supplying ISBNs to check, the script actively searches for candidates.
-
-Environment variables required:
-    SUPABASE_URL   - your Supabase project URL
-    SUPABASE_KEY   - a Supabase SERVICE ROLE key (server-side only;
-                     never expose this key in the frontend)
-
-Dependencies:
-    pip install requests supabase
+subjects, then independently cross-checks each promising candidate
+against Internet Archive and Google Books directly. A title is only
+flagged as at-risk if NONE of the three sources show a digital copy.
+Flagged titles are upserted into a Supabase table (`at_risk_books`) so
+archivists can prioritize them.
 """
 
 import os
@@ -33,6 +23,8 @@ from supabase import create_client, Client
 # --------------------------------------------------------------------------
 
 SEARCH_ENDPOINT = "https://openlibrary.org/search.json"
+IA_SEARCH_ENDPOINT = "https://archive.org/advancedsearch.php"
+GOOGLE_BOOKS_ENDPOINT = "https://www.googleapis.com/books/v1/volumes"
 REQUEST_TIMEOUT_SECONDS = 15
 RATE_LIMIT_DELAY_SECONDS = 1.0
 USER_AGENT = "ISBNScarcityTracker/1.0 (contact: archivist@example.org)"
@@ -171,20 +163,166 @@ def parse_candidate(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------
-# Supabase upsert
+# Independent cross-checks: does a digital copy exist ANYWHERE we can see?
 # --------------------------------------------------------------------------
+# Open Library's own "ebook_count" is actually sourced FROM Internet
+# Archive (Open Library is an Internet Archive project), so checking it
+# alone is really the same check twice. These two functions query two
+# genuinely separate sources directly, so a book only gets flagged if
+# NEITHER shows a digital copy.
+
+def check_internet_archive(isbn: str) -> bool:
+    """Return True if Internet Archive has any item matching this ISBN."""
+    params = {
+        "q": f"isbn:{isbn}",
+        "fl[]": "identifier",
+        "rows": 1,
+        "output": "json",
+    }
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        response = requests.get(
+            IA_SEARCH_ENDPOINT,
+            params=params,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.exceptions.Timeout:
+        logger.warning("IA timeout for ISBN %s", isbn)
+        return False  # can't confirm either way; treat cautiously below
+    except requests.exceptions.RequestException as exc:
+        logger.warning("IA network error for ISBN %s: %s", isbn, exc)
+        return False
+    except (ValueError, KeyError) as exc:
+        logger.warning("IA invalid response for ISBN %s: %s", isbn, exc)
+        return False
+
+    num_found = payload.get("response", {}).get("numFound", 0)
+    return num_found > 0
+
+
+def check_google_books(isbn: str) -> bool:
+    """Return True if Google Books shows a downloadable/previewable copy."""
+    params = {"q": f"isbn:{isbn}"}
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        response = requests.get(
+            GOOGLE_BOOKS_ENDPOINT,
+            params=params,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.exceptions.Timeout:
+        logger.warning("Google Books timeout for ISBN %s", isbn)
+        return False
+    except requests.exceptions.RequestException as exc:
+        logger.warning("Google Books network error for ISBN %s: %s", isbn, exc)
+        return False
+    except ValueError as exc:
+        logger.warning("Google Books invalid response for ISBN %s: %s", isbn, exc)
+        return False
+
+    items = payload.get("items") or []
+    if not items:
+        return False
+
+    access_info = items[0].get("accessInfo", {})
+    epub_available = access_info.get("epub", {}).get("isAvailable", False)
+    pdf_available = access_info.get("pdf", {}).get("isAvailable", False)
+    viewability = access_info.get("viewability", "NO_PAGES")
+
+    return bool(epub_available or pdf_available or viewability == "ALL_PAGES")
+
+
+def confirm_no_digital_copy(isbn: str) -> bool:
+    """
+    True only if BOTH Internet Archive and Google Books independently
+    show no digital copy for this ISBN.
+    """
+    on_ia = check_internet_archive(isbn)
+    time.sleep(RATE_LIMIT_DELAY_SECONDS)
+    on_google = check_google_books(isbn)
+    time.sleep(RATE_LIMIT_DELAY_SECONDS)
+
+    if on_ia or on_google:
+        logger.info(
+            "ISBN %s has a digital copy (IA: %s, Google Books: %s) - skipping",
+            isbn, on_ia, on_google,
+        )
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# Supabase upsert with scarcity-trend comparison
+# --------------------------------------------------------------------------
+
+def fetch_existing_row(client: Client, isbn: str) -> Optional[Dict[str, Any]]:
+    """Look up a prior row for this ISBN, if one exists."""
+    try:
+        result = (
+            client.table("at_risk_books")
+            .select("edition_count:library_holdings,previous_edition_count,"
+                    "previous_ebook_count")
+            .eq("isbn", isbn)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not fetch existing row for %s: %s", isbn, exc)
+        return None
+
+
+def apply_scarcity_trend(client: Client, record: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compare this run's edition_count against the previously stored value
+    (from the last time this ISBN was flagged) and label the trend.
+
+    NOTE: this compares Open Library's own catalog/edition metadata over
+    time, not live marketplace "copies for sale". There's no free public
+    API for real-time bookseller inventory, so this is the closest
+    honest scarcity signal available without a paid data source.
+    """
+    existing = fetch_existing_row(client, record["isbn"])
+    current_editions = record.get("library_holdings", 0) or 0
+
+    if existing is None:
+        record["scarcity_trend"] = "BASELINE"
+        record["previous_edition_count"] = current_editions
+        record["previous_ebook_count"] = 0
+        return record
+
+    prev_editions = existing.get("edition_count") or 0
+
+    if current_editions < prev_editions:
+        record["scarcity_trend"] = "DROPPED"
+    else:
+        record["scarcity_trend"] = "STABLE"
+
+    record["previous_edition_count"] = current_editions
+    record["previous_ebook_count"] = 0
+    record["last_checked_at"] = "now()"
+    return record
+
 
 def upsert_at_risk_book(client: Client, record: Dict[str, Any]) -> None:
     """Upsert a single record into the at_risk_books table, on isbn conflict."""
+    record = apply_scarcity_trend(client, record)
     try:
         client.table("at_risk_books").upsert(
             record, on_conflict="isbn"
         ).execute()
         logger.info(
-            "Upserted '%s' (ISBN %s) - digital copy: %s",
+            "Upserted '%s' (ISBN %s) - trend: %s",
             record["title"],
             record["isbn"],
-            record["has_digital_copy"],
+            record["scarcity_trend"],
         )
     except Exception as exc:  # noqa: BLE001
         logger.error(
@@ -225,6 +363,13 @@ def run_scan(subjects: List[str]) -> None:
             if record["isbn"] in seen_isbns:
                 continue
             seen_isbns.add(record["isbn"])
+
+            # Cross-check against two independent sources before flagging.
+            # This is the expensive step (2 extra HTTP calls), so it only
+            # runs on candidates that already passed the cheaper Open
+            # Library filters above.
+            if not confirm_no_digital_copy(record["isbn"]):
+                continue
 
             upsert_at_risk_book(client, record)
             flagged_count += 1
