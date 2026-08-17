@@ -1,10 +1,14 @@
 """
 ISBN Market Drop & Digital Scarcity Tracker
 --------------------------------------------
-Queries the Open Library Books API for a configurable list of pre-2022,
-out-of-print ISBNs, determines whether a digital (scanned/fulltext) copy
-exists, and upserts any title lacking one into a Supabase table
-(`at_risk_books`) so archivists can prioritize preservation.
+Searches Open Library for candidate pre-2022 titles within a set of
+subjects, using each work's own `ebook_count` to judge whether ANY
+digital scan exists anywhere for that work. Titles with zero digital
+copies AND a low edition count (a rarity signal) are upserted into a
+Supabase table (`at_risk_books`) so archivists can prioritize them.
+
+This replaces the older "hand-typed ISBN list" approach: instead of you
+supplying ISBNs to check, the script actively searches for candidates.
 
 Environment variables required:
     SUPABASE_URL   - your Supabase project URL
@@ -28,20 +32,33 @@ from supabase import create_client, Client
 # Configuration
 # --------------------------------------------------------------------------
 
-OPEN_LIBRARY_ENDPOINT = "https://openlibrary.org/api/books"
-REQUEST_TIMEOUT_SECONDS = 10
+SEARCH_ENDPOINT = "https://openlibrary.org/search.json"
+REQUEST_TIMEOUT_SECONDS = 15
 RATE_LIMIT_DELAY_SECONDS = 1.0
 USER_AGENT = "ISBNScarcityTracker/1.0 (contact: archivist@example.org)"
 
-# Configurable list of sample pre-2022 ISBNs to monitor.
-# Replace/extend this list with the titles you want to track.
-MONITORED_ISBNS: List[str] = [
-    "9780140449136",  # Homer, The Odyssey (Penguin Classics)
-    "9780679732761",  # Cormac McCarthy, Blood Meridian
-    "9780345391803",  # Douglas Adams, Hitchhiker's Guide to the Galaxy
-    "9780060850524",  # Aldous Huxley, Brave New World
-    "9780393315286",  # Chinua Achebe, Things Fall Apart
+# Subjects to search for candidates in. Edit this list to steer the kind
+# of books you're trying to preserve (local history, small-press poetry,
+# regional literature, out-of-print academic work, etc.)
+CANDIDATE_SUBJECTS: List[str] = [
+    "local history",
+    "regional literature",
+    "small press",
+    "out of print",
 ]
+
+# Only consider books first published before this year.
+MAX_PUBLISH_YEAR = 2022
+
+# Rarity heuristic: skip works with more than this many editions, since
+# heavily re-printed books are unlikely to be truly at risk.
+MAX_EDITION_COUNT = 3
+
+# How many search results to pull per subject, per page.
+RESULTS_PER_SUBJECT = 50
+
+# Safety cap: max number of rows written to Supabase in a single run.
+MAX_FLAGGED_PER_RUN = 25
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,24 +91,26 @@ def get_supabase_client() -> Client:
 
 
 # --------------------------------------------------------------------------
-# Open Library lookups
+# Open Library discovery search
 # --------------------------------------------------------------------------
 
-def fetch_book_data(isbn: str) -> Optional[Dict[str, Any]]:
+def search_subject(subject: str) -> List[Dict[str, Any]]:
     """
-    Query the Open Library Books API for a single ISBN.
-    Returns the parsed JSON payload for that ISBN, or None on failure.
+    Search Open Library for candidate works within a subject.
+    Returns the raw list of "doc" records from the search API.
     """
     params = {
-        "bibkeys": f"ISBN:{isbn}",
-        "format": "json",
-        "jscmd": "data",
+        "q": f'subject:"{subject}"',
+        "fields": "title,author_name,isbn,first_publish_year,"
+                  "edition_count,ebook_count_i",
+        "limit": RESULTS_PER_SUBJECT,
+        "sort": "old",  # bias toward older, more likely out-of-print works
     }
     headers = {"User-Agent": USER_AGENT}
 
     try:
         response = requests.get(
-            OPEN_LIBRARY_ENDPOINT,
+            SEARCH_ENDPOINT,
             params=params,
             headers=headers,
             timeout=REQUEST_TIMEOUT_SECONDS,
@@ -99,76 +118,55 @@ def fetch_book_data(isbn: str) -> Optional[Dict[str, Any]]:
         response.raise_for_status()
         payload = response.json()
     except requests.exceptions.Timeout:
-        logger.warning("Timeout while querying ISBN %s", isbn)
-        return None
+        logger.warning("Timeout while searching subject '%s'", subject)
+        return []
     except requests.exceptions.RequestException as exc:
-        logger.warning("Network/API error for ISBN %s: %s", isbn, exc)
-        return None
+        logger.warning("Network/API error searching '%s': %s", subject, exc)
+        return []
     except ValueError as exc:
-        logger.warning("Invalid JSON response for ISBN %s: %s", isbn, exc)
+        logger.warning("Invalid JSON for subject '%s': %s", subject, exc)
+        return []
+
+    return payload.get("docs", [])
+
+
+def parse_candidate(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Turn a raw Open Library search "doc" into our record shape, or return
+    None if the doc doesn't qualify (no ISBN, too recent, too many
+    editions, or a digital copy already exists somewhere).
+    """
+    isbns = doc.get("isbn") or []
+    if not isbns:
+        return None
+    isbn = isbns[0]
+
+    publish_year = doc.get("first_publish_year")
+    if publish_year and publish_year > MAX_PUBLISH_YEAR:
         return None
 
-    key = f"ISBN:{isbn}"
-    book_entry = payload.get(key)
+    edition_count = doc.get("edition_count", 0) or 0
+    if edition_count > MAX_EDITION_COUNT:
+        return None  # too widely reprinted to be "rare"
 
-    if not book_entry:
-        logger.info("No Open Library record found for ISBN %s", isbn)
-        return None
+    ebook_count = doc.get("ebook_count_i", 0) or 0
+    has_digital_copy = ebook_count > 0
 
-    return book_entry
+    if has_digital_copy:
+        return None  # already preserved digitally somewhere; not at risk
 
-
-def parse_book_record(isbn: str, entry: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extract the fields we care about from an Open Library `data` entry,
-    defaulting gracefully whenever a key is missing.
-    """
-    title = entry.get("title", "Unknown Title")
-
-    authors_list = entry.get("authors", [])
-    if authors_list:
-        author = ", ".join(a.get("name", "Unknown") for a in authors_list)
-    else:
-        author = "Unknown"
-
-    publish_date = entry.get("publish_date")
-    publish_year = None
-    if publish_date:
-        # publish_date is free text (e.g. "March 1999"); pull the last
-        # 4-digit run as a best-effort year.
-        digits = "".join(ch if ch.isdigit() else " " for ch in publish_date)
-        candidates = [tok for tok in digits.split() if len(tok) == 4]
-        if candidates:
-            try:
-                publish_year = int(candidates[-1])
-            except ValueError:
-                publish_year = None
-
-    # Digital scarcity check: look for an "ebooks" block with fulltext
-    # access, or an explicit has_fulltext flag.
-    ebooks = entry.get("ebooks", [])
-    has_digital_copy = False
-    for ebook in ebooks:
-        if ebook.get("preview") in ("full", "borrow") or ebook.get(
-            "read_url"
-        ):
-            has_digital_copy = True
-            break
-    if entry.get("has_fulltext"):
-        has_digital_copy = True
-
-    # Open Library doesn't give a "library holdings" count directly via
-    # this endpoint; default to 0 unless a future data source is wired in.
-    library_holdings = entry.get("number_of_pages", 0) and 0
+    title = doc.get("title", "Unknown Title")
+    authors = doc.get("author_name") or []
+    author = ", ".join(authors) if authors else "Unknown"
 
     return {
         "isbn": isbn,
         "title": title,
         "author": author,
         "publish_year": publish_year,
-        "has_digital_copy": has_digital_copy,
-        "library_holdings": library_holdings,
-        "risk_status": "HIGH RISK" if not has_digital_copy else "MONITORED",
+        "has_digital_copy": False,
+        "library_holdings": edition_count,
+        "risk_status": "HIGH RISK",
     }
 
 
@@ -198,46 +196,52 @@ def upsert_at_risk_book(client: Client, record: Dict[str, Any]) -> None:
 # Main run loop
 # --------------------------------------------------------------------------
 
-def run_scan(isbns: List[str]) -> None:
+def run_scan(subjects: List[str]) -> None:
     client = get_supabase_client()
 
     flagged_count = 0
+    checked_count = 0
+    seen_isbns = set()
 
-    for isbn in isbns:
-        logger.info("Checking ISBN %s...", isbn)
+    for subject in subjects:
+        if flagged_count >= MAX_FLAGGED_PER_RUN:
+            break
 
-        entry = fetch_book_data(isbn)
-        if entry is None:
-            time.sleep(RATE_LIMIT_DELAY_SECONDS)
-            continue
+        logger.info("Searching subject '%s'...", subject)
+        docs = search_subject(subject)
+        logger.info("  -> %d candidate works returned", len(docs))
 
-        try:
-            record = parse_book_record(isbn, entry)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to parse record for ISBN %s: %s", isbn, exc)
-            time.sleep(RATE_LIMIT_DELAY_SECONDS)
-            continue
+        for doc in docs:
+            checked_count += 1
+            try:
+                record = parse_candidate(doc)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed to parse a candidate doc: %s", exc)
+                continue
 
-        # Only flag titles that currently lack a digital copy.
-        if not record["has_digital_copy"]:
+            if record is None:
+                continue  # didn't qualify (too common, has a scan, etc.)
+
+            if record["isbn"] in seen_isbns:
+                continue
+            seen_isbns.add(record["isbn"])
+
             upsert_at_risk_book(client, record)
             flagged_count += 1
-        else:
-            logger.info(
-                "'%s' (ISBN %s) already has a digital copy - skipping.",
-                record["title"],
-                isbn,
-            )
 
-        # Respect Open Library's rate limits.
+            if flagged_count >= MAX_FLAGGED_PER_RUN:
+                logger.info("Reached MAX_FLAGGED_PER_RUN cap; stopping.")
+                break
+
+        # Respect Open Library's rate limits between subject searches.
         time.sleep(RATE_LIMIT_DELAY_SECONDS)
 
     logger.info(
-        "Scan complete. %d/%d titles flagged as at-risk.",
+        "Scan complete. Checked %d candidates, flagged %d as at-risk.",
+        checked_count,
         flagged_count,
-        len(isbns),
     )
 
 
 if __name__ == "__main__":
-    run_scan(MONITORED_ISBNS)
+    run_scan(CANDIDATE_SUBJECTS)
