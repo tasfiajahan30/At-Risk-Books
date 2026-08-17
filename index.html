@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>The Scarcity Ledger — At-Risk Book Registry</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Special+Elite&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #171a16;
+    --surface: #20241f;
+    --surface-raised: #262b24;
+    --paper: #e9e3d3;
+    --paper-dim: #a29b87;
+    --stamp-red: #b23b34;
+    --stamp-red-glow: rgba(178, 59, 52, 0.18);
+    --archive-green: #7ea076;
+    --archive-green-dim: rgba(126, 160, 118, 0.18);
+    --hairline: #3a3f37;
+    --radius: 3px;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ink);
+    background-image:
+      radial-gradient(ellipse at top left, rgba(126,160,118,0.05), transparent 45%),
+      radial-gradient(ellipse at bottom right, rgba(178,59,52,0.05), transparent 50%);
+    color: var(--paper);
+    font-family: 'Source Serif 4', serif;
+    min-height: 100vh;
+  }
+
+  /* ---------- Header ---------- */
+  header {
+    border-bottom: 1px solid var(--hairline);
+    padding: 3rem 1.5rem 2rem;
+    text-align: center;
+    position: relative;
+  }
+
+  .eyebrow {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--paper-dim);
+    margin-bottom: 0.9rem;
+  }
+
+  h1 {
+    font-family: 'Special Elite', cursive;
+    font-weight: 400;
+    font-size: clamp(1.8rem, 5vw, 3.1rem);
+    letter-spacing: 0.01em;
+    margin: 0 0 0.6rem;
+    color: var(--paper);
+  }
+
+  .tagline {
+    max-width: 46ch;
+    margin: 0 auto;
+    color: var(--paper-dim);
+    font-size: 1rem;
+    line-height: 1.55;
+    font-style: italic;
+  }
+
+  .stats-row {
+    display: flex;
+    justify-content: center;
+    gap: 2.5rem;
+    margin-top: 2.2rem;
+    flex-wrap: wrap;
+  }
+
+  .stat {
+    text-align: center;
+    min-width: 90px;
+  }
+
+  .stat-num {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 1.9rem;
+    font-weight: 600;
+    color: var(--stamp-red);
+    line-height: 1;
+    display: block;
+  }
+
+  .stat-num.safe { color: var(--archive-green); }
+
+  .stat-label {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.65rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--paper-dim);
+    margin-top: 0.4rem;
+    display: block;
+  }
+
+  /* ---------- Controls ---------- */
+  .controls {
+    max-width: 1000px;
+    margin: 2.2rem auto 0;
+    padding: 0 1.5rem;
+    display: flex;
+    gap: 0.8rem;
+    flex-wrap: wrap;
+  }
+
+  #search {
+    flex: 1;
+    min-width: 220px;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    color: var(--paper);
+    padding: 0.85rem 1rem;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.9rem;
+    outline: none;
+    transition: border-color 0.15s ease;
+  }
+
+  #search::placeholder { color: var(--paper-dim); }
+  #search:focus { border-color: var(--archive-green); }
+
+  /* ---------- Ledger ---------- */
+  main {
+    max-width: 1000px;
+    margin: 2rem auto 5rem;
+    padding: 0 1.5rem;
+  }
+
+  #status-line {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.78rem;
+    color: var(--paper-dim);
+    margin-bottom: 1rem;
+    min-height: 1.2rem;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    padding: 1.4rem 1.5rem;
+    margin-bottom: 1rem;
+    position: relative;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.4rem 1.2rem;
+    align-items: start;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+  }
+
+  .card:hover {
+    border-color: var(--paper-dim);
+  }
+
+  .card-title {
+    font-size: 1.15rem;
+    font-weight: 600;
+    color: var(--paper);
+    line-height: 1.3;
+    margin: 0;
+  }
+
+  .card-author {
+    font-style: italic;
+    color: var(--paper-dim);
+    font-size: 0.92rem;
+    margin: 0.15rem 0 0;
+  }
+
+  .card-meta {
+    grid-column: 1 / 2;
+    display: flex;
+    gap: 1.1rem;
+    flex-wrap: wrap;
+    margin-top: 0.7rem;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--paper-dim);
+  }
+
+  .card-meta span b {
+    color: var(--paper);
+    font-weight: 500;
+  }
+
+  .stamp {
+    font-family: 'Special Elite', cursive;
+    font-size: 0.78rem;
+    letter-spacing: 0.06em;
+    padding: 0.35rem 0.7rem;
+    border: 2px solid var(--stamp-red);
+    color: var(--stamp-red);
+    border-radius: var(--radius);
+    transform: rotate(-3deg);
+    white-space: nowrap;
+    text-transform: uppercase;
+    justify-self: end;
+  }
+
+  .stamp.safe {
+    border-color: var(--archive-green);
+    color: var(--archive-green);
+    transform: rotate(2deg);
+  }
+
+  .actions {
+    grid-column: 1 / -1;
+    display: flex;
+    gap: 0.7rem;
+    margin-top: 1rem;
+    flex-wrap: wrap;
+  }
+
+  .action-link {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.03em;
+    text-decoration: none;
+    padding: 0.5rem 0.85rem;
+    border-radius: var(--radius);
+    border: 1px solid var(--hairline);
+    color: var(--paper-dim);
+    transition: all 0.15s ease;
+  }
+
+  .action-link.primary {
+    border-color: var(--archive-green);
+    color: var(--archive-green);
+  }
+
+  .action-link:hover {
+    background: var(--surface-raised);
+    color: var(--paper);
+  }
+
+  .action-link.primary:hover {
+    background: var(--archive-green-dim);
+    color: var(--archive-green);
+  }
+
+  /* ---------- Empty / loading states ---------- */
+  .empty-state, .loading-state, .error-state {
+    text-align: center;
+    padding: 3.5rem 1.5rem;
+    color: var(--paper-dim);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.85rem;
+    border: 1px dashed var(--hairline);
+    border-radius: var(--radius);
+  }
+
+  .error-state { color: var(--stamp-red); border-color: var(--stamp-red); }
+
+  footer {
+    text-align: center;
+    padding: 2rem 1.5rem 3rem;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.7rem;
+    color: var(--paper-dim);
+    border-top: 1px solid var(--hairline);
+  }
+
+  footer a { color: var(--archive-green); }
+
+  @media (max-width: 560px) {
+    .card { grid-template-columns: 1fr; }
+    .stamp { justify-self: start; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="eyebrow">Digital Scarcity Registry · Est. today</div>
+  <h1>The Scarcity Ledger</h1>
+  <p class="tagline">
+    A living registry of out-of-print titles with no known digital scan.
+    Every entry below is a book that could vanish. Preserve one before it does.
+  </p>
+
+  <div class="stats-row">
+    <div class="stat">
+      <span class="stat-num" id="stat-total">—</span>
+      <span class="stat-label">Titles Logged</span>
+    </div>
+    <div class="stat">
+      <span class="stat-num" id="stat-high-risk">—</span>
+      <span class="stat-label">High Risk</span>
+    </div>
+    <div class="stat">
+      <span class="stat-num safe" id="stat-monitored">—</span>
+      <span class="stat-label">Monitored</span>
+    </div>
+  </div>
+</header>
+
+<div class="controls">
+  <input id="search" type="text" placeholder="Search the ledger — title, author, or ISBN..." autocomplete="off" />
+</div>
+
+<main>
+  <div id="status-line"></div>
+  <div id="ledger"></div>
+</main>
+
+<footer>
+  Sourced from Open Library metadata. Read-only public ledger — writes are
+  performed by an automated daily scan. Learn to
+  <a href="https://help.archive.org/help/uploading-a-file-to-the-internet-archive/" target="_blank" rel="noopener">upload to the Internet Archive</a>.
+</footer>
+
+<script type="module">
+  import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+
+ 
+  // ---------------------------------------------------------------
+  const SUPABASE_URL = "https://wkmoqczvckyvlwgzhuqn.supabase.co";
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndrbW9xY3p2Y2t5dmx3Z3podXFuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY5NjYzMDMsImV4cCI6MjEwMjU0MjMwM30.JDl_Dy1nMuNUeABv501dnkIKFg0ev6hf8NM6NlQ5FC8";
+  // ---------------------------------------------------------------
+
+  const statusLine = document.getElementById('status-line');
+  const ledgerEl = document.getElementById('ledger');
+  const searchInput = document.getElementById('search');
+
+  let allBooks = [];
+
+  function escapeHtml(str) {
+    return String(str ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function renderStats(books) {
+    const total = books.length;
+    const highRisk = books.filter(b => (b.risk_status || '').toUpperCase() === 'HIGH RISK').length;
+    const monitored = total - highRisk;
+    document.getElementById('stat-total').textContent = total;
+    document.getElementById('stat-high-risk').textContent = highRisk;
+    document.getElementById('stat-monitored').textContent = monitored;
+  }
+
+  function renderLedger(books) {
+    if (books.length === 0) {
+      ledgerEl.innerHTML = `<div class="empty-state">No entries match. The ledger is quiet — for now.</div>`;
+      return;
+    }
+
+    ledgerEl.innerHTML = books.map(book => {
+      const isHighRisk = (book.risk_status || '').toUpperCase() === 'HIGH RISK';
+      const isbn = escapeHtml(book.isbn);
+      const title = escapeHtml(book.title);
+      const author = escapeHtml(book.author || 'Unknown');
+      const year = book.publish_year ? escapeHtml(book.publish_year) : '—';
+      const holdings = book.library_holdings ?? 0;
+      const detected = book.detected_at
+        ? new Date(book.detected_at).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+        : '—';
+
+      const stampClass = isHighRisk ? 'stamp' : 'stamp safe';
+      const stampLabel = isHighRisk ? 'High Risk' : 'Monitored';
+
+      const uploadUrl = `https://archive.org/upload/`;
+      const searchUrl = `https://archive.org/search.php?query=${encodeURIComponent(isbn)}`;
+
+      return `
+        <article class="card">
+          <div>
+            <h3 class="card-title">${title}</h3>
+            <p class="card-author">${author}</p>
+            <div class="card-meta">
+              <span>ISBN <b>${isbn}</b></span>
+              <span>Published <b>${year}</b></span>
+              <span>Library holdings <b>${holdings}</b></span>
+              <span>Logged <b>${detected}</b></span>
+            </div>
+          </div>
+          <div class="${stampClass}">${stampLabel}</div>
+          <div class="actions">
+            <a class="action-link primary" href="${uploadUrl}" target="_blank" rel="noopener">Upload a scan →</a>
+            <a class="action-link" href="${searchUrl}" target="_blank" rel="noopener">Check Internet Archive →</a>
+          </div>
+        </article>
+      `;
+    }).join('');
+  }
+
+  function applyFilter() {
+    const q = searchInput.value.trim().toLowerCase();
+    if (!q) {
+      renderLedger(allBooks);
+      return;
+    }
+    const filtered = allBooks.filter(b =>
+      (b.title || '').toLowerCase().includes(q) ||
+      (b.author || '').toLowerCase().includes(q) ||
+      (b.isbn || '').toLowerCase().includes(q)
+    );
+    renderLedger(filtered);
+  }
+
+  searchInput.addEventListener('input', applyFilter);
+
+  async function loadLedger() {
+    if (SUPABASE_URL.includes('YOUR-PROJECT-REF') || SUPABASE_ANON_KEY.includes('YOUR-ANON')) {
+      statusLine.textContent = '';
+      ledgerEl.innerHTML = `<div class="error-state">
+        Configuration needed: set SUPABASE_URL and SUPABASE_ANON_KEY at the
+        top of the &lt;script&gt; block in this file.
+      </div>`;
+      return;
+    }
+
+    statusLine.textContent = 'Reading the ledger…';
+    ledgerEl.innerHTML = `<div class="loading-state">Pulling the latest scan results…</div>`;
+
+    try {
+      const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+      const { data, error } = await supabase
+        .from('at_risk_books')
+        .select('*')
+        .order('detected_at', { ascending: false });
+
+      if (error) throw error;
+
+      allBooks = data || [];
+      renderStats(allBooks);
+      renderLedger(allBooks);
+      statusLine.textContent = `${allBooks.length} title${allBooks.length === 1 ? '' : 's'} on record · updated on page load`;
+    } catch (err) {
+      console.error(err);
+      statusLine.textContent = '';
+      ledgerEl.innerHTML = `<div class="error-state">
+        Couldn't reach the ledger. Check your Supabase URL/key and RLS
+        policies, then reload.
+      </div>`;
+    }
+  }
+
+  loadLedger();
+</script>
+
+</body>
+</html>
