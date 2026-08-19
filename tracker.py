@@ -1,3 +1,4 @@
+
 """
 ISBN Market Drop & Digital Scarcity Tracker
 --------------------------------------------
@@ -7,13 +8,21 @@ against Internet Archive and Google Books directly. A title is only
 flagged as at-risk if NONE of the three sources show a digital copy.
 Flagged titles are upserted into a Supabase table (`at_risk_books`) so
 archivists can prioritize them.
+
+PAGINATION:
+Each subject's scan position (Open Library "page" number) is persisted
+in a small `scan_state` table in Supabase, so every run advances
+through fresh results instead of re-fetching the same page every time.
+ISBNs already present in `at_risk_books` are also skipped before the
+expensive Internet Archive / Google Books cross-check, so re-runs don't
+waste API calls re-confirming books you've already logged.
 """
 
 import os
 import sys
 import time
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 
 import requests
 from supabase import create_client, Client
@@ -52,6 +61,10 @@ RESULTS_PER_SUBJECT = 50
 # Safety cap: max number of rows written to Supabase in a single run.
 MAX_FLAGGED_PER_RUN = 25
 
+# Safety cap: if a subject's page number climbs past this, wrap back to
+# page 1. Prevents infinite growth once a subject is fully exhausted.
+MAX_PAGE_PER_SUBJECT = 40
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -83,19 +96,72 @@ def get_supabase_client() -> Client:
 
 
 # --------------------------------------------------------------------------
+# Scan-state persistence (per-subject Open Library page offset)
+# --------------------------------------------------------------------------
+
+def get_subject_page(client: Client, subject: str) -> int:
+    """Look up the next Open Library page to fetch for this subject."""
+    try:
+        result = (
+            client.table("scan_state")
+            .select("next_page")
+            .eq("subject", subject)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if rows:
+            return rows[0].get("next_page", 1) or 1
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not fetch scan_state for '%s': %s", subject, exc)
+    return 1
+
+
+def set_subject_page(client: Client, subject: str, next_page: int) -> None:
+    """Persist the next page to fetch for this subject, wrapping if needed."""
+    if next_page > MAX_PAGE_PER_SUBJECT:
+        next_page = 1  # start over once we've exhausted the subject
+
+    try:
+        client.table("scan_state").upsert(
+            {"subject": subject, "next_page": next_page, "updated_at": "now()"},
+            on_conflict="subject",
+        ).execute()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not save scan_state for '%s': %s", subject, exc)
+
+
+def get_known_isbns(client: Client) -> Set[str]:
+    """
+    Pull the set of ISBNs already logged in at_risk_books, so we can skip
+    them before spending API calls on the Internet Archive / Google Books
+    cross-check. Keeps re-runs cheap and makes 'found nothing new' mean
+    what it says.
+    """
+    try:
+        result = client.table("at_risk_books").select("isbn").execute()
+        rows = result.data or []
+        return {row["isbn"] for row in rows if row.get("isbn")}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not fetch known ISBNs: %s", exc)
+        return set()
+
+
+# --------------------------------------------------------------------------
 # Open Library discovery search
 # --------------------------------------------------------------------------
 
-def search_subject(subject: str) -> List[Dict[str, Any]]:
+def search_subject(subject: str, page: int) -> List[Dict[str, Any]]:
     """
-    Search Open Library for candidate works within a subject.
-    Returns the raw list of "doc" records from the search API.
+    Search Open Library for candidate works within a subject, at the
+    given page offset. Returns the raw list of "doc" records.
     """
     params = {
         "q": f'subject:"{subject}"',
         "fields": "title,author_name,isbn,first_publish_year,"
                   "edition_count,ebook_count_i",
         "limit": RESULTS_PER_SUBJECT,
+        "page": page,
         "sort": "old",  # bias toward older, more likely out-of-print works
     }
     headers = {"User-Agent": USER_AGENT}
@@ -110,13 +176,13 @@ def search_subject(subject: str) -> List[Dict[str, Any]]:
         response.raise_for_status()
         payload = response.json()
     except requests.exceptions.Timeout:
-        logger.warning("Timeout while searching subject '%s'", subject)
+        logger.warning("Timeout while searching subject '%s' (page %d)", subject, page)
         return []
     except requests.exceptions.RequestException as exc:
-        logger.warning("Network/API error searching '%s': %s", subject, exc)
+        logger.warning("Network/API error searching '%s' (page %d): %s", subject, page, exc)
         return []
     except ValueError as exc:
-        logger.warning("Invalid JSON for subject '%s': %s", subject, exc)
+        logger.warning("Invalid JSON for subject '%s' (page %d): %s", subject, page, exc)
         return []
 
     return payload.get("docs", [])
@@ -339,15 +405,27 @@ def run_scan(subjects: List[str]) -> None:
 
     flagged_count = 0
     checked_count = 0
-    seen_isbns = set()
+    skipped_known_count = 0
+    seen_isbns: Set[str] = set()
+
+    # ISBNs we've already logged in previous runs - skip these before
+    # spending API calls on the IA / Google Books cross-check.
+    known_isbns = get_known_isbns(client)
+    logger.info("Loaded %d previously-logged ISBNs to skip.", len(known_isbns))
 
     for subject in subjects:
         if flagged_count >= MAX_FLAGGED_PER_RUN:
             break
 
-        logger.info("Searching subject '%s'...", subject)
-        docs = search_subject(subject)
+        page = get_subject_page(client, subject)
+        logger.info("Searching subject '%s' (page %d)...", subject, page)
+        docs = search_subject(subject, page)
         logger.info("  -> %d candidate works returned", len(docs))
+
+        # Advance this subject's page for next run regardless of outcome,
+        # so a subject that returns nothing flaggable doesn't get stuck
+        # re-fetching the same page forever.
+        set_subject_page(client, subject, page + 1)
 
         for doc in docs:
             checked_count += 1
@@ -364,14 +442,21 @@ def run_scan(subjects: List[str]) -> None:
                 continue
             seen_isbns.add(record["isbn"])
 
+            if record["isbn"] in known_isbns:
+                # Already logged in a previous run - no need to re-run
+                # the expensive cross-check just to refresh the trend.
+                skipped_known_count += 1
+                continue
+
             # Cross-check against two independent sources before flagging.
             # This is the expensive step (2 extra HTTP calls), so it only
             # runs on candidates that already passed the cheaper Open
-            # Library filters above.
+            # Library filters above and aren't already logged.
             if not confirm_no_digital_copy(record["isbn"]):
                 continue
 
             upsert_at_risk_book(client, record)
+            known_isbns.add(record["isbn"])
             flagged_count += 1
 
             if flagged_count >= MAX_FLAGGED_PER_RUN:
@@ -382,8 +467,10 @@ def run_scan(subjects: List[str]) -> None:
         time.sleep(RATE_LIMIT_DELAY_SECONDS)
 
     logger.info(
-        "Scan complete. Checked %d candidates, flagged %d as at-risk.",
+        "Scan complete. Checked %d candidates, skipped %d already-known, "
+        "flagged %d new at-risk titles.",
         checked_count,
+        skipped_known_count,
         flagged_count,
     )
 
